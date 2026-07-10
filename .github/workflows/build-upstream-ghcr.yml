@@ -1,0 +1,140 @@
+name: Build upstream image to GHCR
+
+on:
+  # 支持从 GitHub Actions 页面手动运行
+  workflow_dispatch:
+
+  # 每 6 小时检查一次上游
+  # GitHub cron 默认使用 UTC；避开整点以减少排队概率
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: migu-video-ghcr-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 这里检出的不是自己的 Fork，而是原作者的最新 main
+      - name: Checkout upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: develop202/migu_video
+          ref: main
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 生成上游版本号和运行代码指纹。
+      #
+      # interface.txt、playback.xml 等文件经常自动变化，
+      # 但这些变化没有必要导致容器不断重新构建和重启，
+      # 所以将生成的播放列表、文档和工作流排除在指纹之外。
+      - name: Calculate source identity
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_sha="$(git -C source rev-parse HEAD)"
+
+          source_hash="$(
+            cd source
+
+            find . -type f \
+              ! -path "./.git/*" \
+              ! -path "./.github/*" \
+              ! -name "README.md" \
+              ! -name "interface.txt" \
+              ! -name "interfaceTXT.txt" \
+              ! -name "playback.xml" \
+              -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sha256sum \
+            | awk '{print $1}'
+          )"
+
+          # 每周即使源码没变，也重新构建一次，
+          # 以便获取 node:22-alpine 的基础镜像更新。
+          week="$(date -u +%G-W%V)"
+          build_key="${source_hash}-${week}"
+
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          echo "source_hash=${source_hash}" >> "$GITHUB_OUTPUT"
+          echo "build_key=${build_key}" >> "$GITHUB_OUTPUT"
+
+          echo "Upstream commit: ${upstream_sha}"
+          echo "Source hash: ${source_hash}"
+          echo "Build key: ${build_key}"
+
+      # GHCR 镜像路径必须使用小写
+      - name: Set image name
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=ghcr.io/${owner}/migu_video" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # 相同运行代码在本周已经构建过，就不再重复构建。
+      # 这样 interface.txt 等自动更新不会导致 Watchtower 频繁重启容器。
+      - name: Check whether image already exists
+        id: check
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          BUILD_KEY: ${{ steps.source.outputs.build_key }}
+        run: |
+          set -euo pipefail
+
+          if docker buildx imagetools inspect \
+            "${IMAGE_NAME}:build-${BUILD_KEY}" \
+            >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "The current source has already been built."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "A new image build is required."
+          fi
+
+      - name: Build and push image
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ./source
+          file: ./source/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:upstream-${{ steps.source.outputs.upstream_sha }}
+            ${{ steps.image.outputs.name }}:build-${{ steps.source.outputs.build_key }}
+
+          labels: |
+            org.opencontainers.image.title=migu_video
+            org.opencontainers.image.source=https://github.com/develop202/migu_video
+            org.opencontainers.image.revision=${{ steps.source.outputs.upstream_sha }}
+            org.opencontainers.image.description=Automatically built from develop202/migu_video
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
