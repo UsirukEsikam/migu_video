@@ -1,0 +1,293 @@
+name: Track & Build migu_video
+
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Force rebuild even if inputs are unchanged
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build.yml
+
+concurrency:
+  group: build-migu-video
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+  BASE_IMAGE: node:22-alpine
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      image_name: ${{ steps.check.outputs.image_name }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      source_hash: ${{ steps.check.outputs.source_hash }}
+      base_digest: ${{ steps.check.outputs.base_digest }}
+      config_hash: ${{ steps.check.outputs.config_hash }}
+      config_sha: ${{ steps.check.outputs.config_sha }}
+
+    steps:
+      - name: Checkout build configuration
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: develop202/migu_video
+          ref: main
+          path: source
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check build inputs
+        id: check
+        shell: bash
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          config_sha="$(git rev-parse HEAD)"
+          config_hash="$(sha256sum .github/workflows/build.yml | cut -d ' ' -f1)"
+          upstream_sha="$(git -C source rev-parse HEAD)"
+
+          # Fail explicitly if upstream changes the expected base image or layout.
+          # The build job pins this exact FROM instruction to the checked digest.
+          if [[ "$(grep -ciE '^[[:space:]]*FROM[[:space:]]' source/Dockerfile)" != 1 ]] ||
+             ! grep -Fxq "FROM ${BASE_IMAGE}" source/Dockerfile; then
+            echo '::error::Upstream Dockerfile FROM instruction changed; review the build workflow.'
+            exit 1
+          fi
+
+          # Hash tracked file paths, modes and blob IDs. Generated playlists,
+          # documentation and CI metadata do not trigger an image update.
+          source_hash="$(git -C source ls-tree -rz HEAD | python3 -c '
+          import hashlib
+          import sys
+          excluded = {b"README.md", b"interface.txt", b"interfaceTXT.txt", b"playback.xml", b".gitignore"}
+          h = hashlib.sha256()
+          for entry in sys.stdin.buffer.read().split(b"\0"):
+              if not entry:
+                  continue
+              path = entry.split(b"\t", 1)[1]
+              if path in excluded or path.startswith((b".github/", b".workflow/")):
+                  continue
+              h.update(entry + b"\0")
+          print(h.hexdigest())
+          ')"
+
+          base_digest="$(docker buildx imagetools inspect "${BASE_IMAGE}" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Invalid base image digest.'
+            exit 1
+          fi
+
+          printf -v expected 'source_hash=%s\nbase_image_digest=%s\nbuild_config_hash=%s\nplatforms=%s' \
+            "$source_hash" "$base_digest" "$config_hash" "$PLATFORMS"
+
+          changed=true
+          if [[ "$FORCE" != true && -f versions.txt ]] &&
+             [[ "$(head -n 4 versions.txt)" == "$expected" ]]; then
+            recorded_digest="$(sed -n 's/^image_digest=//p' versions.txt)"
+            if [[ "$recorded_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              if current_digest="$(docker buildx imagetools inspect "${image_name}:latest" --format '{{.Manifest.Digest}}')"; then
+                if [[ "$current_digest" == "$recorded_digest" ]]; then
+                  changed=false
+                fi
+              else
+                echo '::warning::Cannot inspect latest; attempt to rebuild and restore it.'
+              fi
+            fi
+          fi
+
+          {
+            echo "changed=${changed}"
+            echo "image_name=${image_name}"
+            echo "upstream_sha=${upstream_sha}"
+            echo "source_hash=${source_hash}"
+            echo "base_digest=${base_digest}"
+            echo "config_hash=${config_hash}"
+            echo "config_sha=${config_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%s\n' "$expected" "upstream_sha=${upstream_sha}" "build_required=${changed}"
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    env:
+      IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+      UPSTREAM_SHA: ${{ needs.check.outputs.upstream_sha }}
+      SOURCE_HASH: ${{ needs.check.outputs.source_hash }}
+      BASE_DIGEST: ${{ needs.check.outputs.base_digest }}
+      CONFIG_HASH: ${{ needs.check.outputs.config_hash }}
+      CONFIG_SHA: ${{ needs.check.outputs.config_sha }}
+      BUILD_TAG: ${{ github.run_number }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout checked configuration
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.config_sha }}
+
+      - name: Checkout checked upstream commit
+        uses: actions/checkout@v7
+        with:
+          repository: develop202/migu_video
+          ref: ${{ needs.check.outputs.upstream_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Pin upstream base image
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq "FROM ${BASE_IMAGE}" source/Dockerfile
+          sed -i "s|^FROM ${BASE_IMAGE}$|FROM ${BASE_IMAGE}@${BASE_DIGEST}|" source/Dockerfile
+          grep -Fxq "FROM ${BASE_IMAGE}@${BASE_DIGEST}" source/Dockerfile
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish a candidate first. Leave latest unchanged until all tests pass.
+      - name: Build and push candidate
+        id: candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: ./source
+          file: ./source/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          pull: true
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.BUILD_TAG }}
+          labels: |
+            org.opencontainers.image.title=migu_video
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.CONFIG_SHA }}
+            org.opencontainers.image.base.name=${{ env.BASE_IMAGE }}
+            org.opencontainers.image.base.digest=${{ env.BASE_DIGEST }}
+            io.github.migu-video.upstream=https://github.com/develop202/migu_video
+            io.github.migu-video.upstream-revision=${{ env.UPSTREAM_SHA }}
+            io.github.migu-video.source-hash=${{ env.SOURCE_HASH }}
+          cache-from: type=gha,scope=migu-video
+          cache-to: type=gha,scope=migu-video,mode=max
+
+      - name: Smoke test all platforms
+        shell: bash
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cid=''
+          cleanup() {
+            if [[ -n "$cid" ]]; then
+              docker rm -f "$cid" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+          IFS=',' read -ra platforms <<< "$PLATFORMS"
+          for platform in "${platforms[@]}"; do
+            echo "Testing ${platform}"
+            docker pull --platform "$platform" "${IMAGE_NAME}@${DIGEST}"
+            cid="$(docker run -d --platform "$platform" --network none \
+              -e mignoreCategory=TV,PE -e mport=1234 \
+              "${IMAGE_NAME}@${DIGEST}")"
+            ready=false
+            for attempt in {1..20}; do
+              if docker exec "$cid" node -e 'fetch("http://127.0.0.1:1234/m3u", {signal: AbortSignal.timeout(3000)}).then(async r => { if (!r.ok || !(await r.text()).trimStart().startsWith("#EXTM3U")) process.exit(1); }).catch(() => process.exit(1));'; then
+                ready=true
+                break
+              fi
+              if [[ "$(docker inspect -f '{{.State.Running}}' "$cid")" != true ]]; then
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$ready" != true ]]; then
+              docker logs "$cid" || true
+              echo "::error::Smoke test failed for ${platform}."
+              exit 1
+            fi
+            cleanup
+            cid=''
+          done
+
+      - name: Promote tested image and record state
+        shell: bash
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          # If the workflow changed during this run, let the new workflow publish.
+          git fetch origin main
+          current_hash="$(git show FETCH_HEAD:.github/workflows/build.yml | sha256sum | cut -d ' ' -f1)"
+          if [[ "$current_hash" != "$CONFIG_HASH" ]]; then
+            echo '::error::Build configuration changed during this run. Run the new workflow.'
+            exit 1
+          fi
+
+          docker buildx imagetools create --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}@${DIGEST}"
+          published_digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:latest" --format '{{.Manifest.Digest}}')"
+          if [[ "$published_digest" != "$DIGEST" ]]; then
+            echo '::error::Published latest digest does not match the tested image.'
+            exit 1
+          fi
+
+          git checkout -B main FETCH_HEAD
+          printf 'source_hash=%s\nbase_image_digest=%s\nbuild_config_hash=%s\nplatforms=%s\nupstream_sha=%s\nimage_digest=%s\n' \
+            "$SOURCE_HASH" "$BASE_DIGEST" "$CONFIG_HASH" "$PLATFORMS" "$UPSTREAM_SHA" "$published_digest" > versions.txt
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add versions.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record migu_video build ${BUILD_TAG}"
+            git push origin HEAD:main
+          fi
